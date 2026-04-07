@@ -1,0 +1,4 @@
+claude:
+  cli_path: "C:\\ProgramData\\chocolatey\\bin\\claude.exe"
+  workdir: "D:\\workspace\\feilaude"
+  timeout: 600
