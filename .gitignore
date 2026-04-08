@@ -22,3 +22,6 @@ venv/
 
 # Sessions data
 sessions.yaml
+
+openspec/
+CLAUDE.md

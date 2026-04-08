@@ -10,6 +10,15 @@ from state import BotState
 
 logger = logging.getLogger(__name__)
 
+
+def _log_task_exception(task: asyncio.Task):
+    """Done callback to catch exceptions that escaped try/except."""
+    if task.cancelled():
+        logger.warning("任务被取消")
+        return
+    if task.exception():
+        logger.error("任务未捕获异常：%s", task.exception(), exc_info=task.exception())
+
 MANAGEMENT_COMMANDS = ("/new", "/use", "/sessions", "/delete", "/status", "/cancel")
 
 
@@ -235,33 +244,39 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
         sender.send_message(sender_open_id, status_text)
 
     async def run():
-        text, sid = await execute_claude(
-            prompt=raw_text,
-            cli_path=config.cli_path,
-            workdir=session.workdir,
-            timeout=config.timeout,
-            session_id=session.sid,
-            on_status=on_status,
-            cancel_event=state.cancel_event,
-        )
+        try:
+            text, sid = await execute_claude(
+                prompt=raw_text,
+                cli_path=config.cli_path,
+                workdir=session.workdir,
+                timeout=config.timeout,
+                session_id=session.sid,
+                on_status=on_status,
+                cancel_event=state.cancel_event,
+            )
 
-        # Update session: bind sid if first time, touch last_used
-        if sid and not session.sid:
-            session_mgr.update_sid(session.name, sid)
-        session_mgr.touch(session.name)
+            # Update session: bind sid if first time, touch last_used
+            if sid and not session.sid:
+                session_mgr.update_sid(session.name, sid)
+            session_mgr.touch(session.name)
 
-        state.set_idle()
-        logger.info("执行完成，结果长度=%d", len(text))
-        sender.send_card(sender_open_id, text)
+            logger.info("执行完成，结果长度=%d", len(text))
+            sender.send_card(sender_open_id, text)
 
-        # Check for queued messages
-        queued = state.drain_queue()
-        if queued:
-            merged = _merge_queue(queued)
-            _execute_and_reply(merged, session, sender_open_id, sender, config, session_mgr, state)
+            # Check for queued messages (only on success)
+            queued = state.drain_queue()
+            if queued:
+                merged = _merge_queue(queued)
+                _execute_and_reply(merged, session, sender_open_id, sender, config, session_mgr, state)
+        except Exception as e:
+            logger.error("执行任务异常", exc_info=True)
+            sender.send_message(sender_open_id, f"执行出错：{e}")
+            state.drain_queue()  # discard queued messages on failure
+        finally:
+            state.set_idle()
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(run())
+    task = asyncio.get_event_loop().create_task(run())
+    task.add_done_callback(_log_task_exception)
 
 
 def _merge_queue(messages: list[str]) -> str:

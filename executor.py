@@ -36,6 +36,7 @@ async def execute_claude(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=workdir,
+            limit=10 * 1024 * 1024,  # 10MB, avoid LimitOverrunError on long JSON lines
         )
         logger.info("子进程已启动，PID=%d", process.pid)
     except OSError as e:
@@ -52,11 +53,15 @@ async def execute_claude(
         while True:
             if cancel_event and cancel_event.is_set():
                 logger.info("检测到取消信号，终止子进程 PID=%d", process.pid)
-                process.kill()
                 result_text = "任务已取消"
                 return
 
-            line_bytes = await process.stdout.readline()
+            try:
+                line_bytes = await process.stdout.readline()
+            except ValueError as e:
+                logger.error("readline 异常（可能缓冲区溢出）：PID=%d, error=%s", process.pid, e)
+                result_text = f"读取输出失败：{e}"
+                return
             if not line_bytes:
                 break
             line = line_bytes.decode("utf-8", errors="replace").strip()
@@ -97,23 +102,38 @@ async def execute_claude(
             # Unknown event types are silently ignored
 
     try:
-        await asyncio.wait_for(_read_stream(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("子进程超时（%d秒），正在终止 PID=%d", timeout, process.pid)
-        process.kill()
-        return ("指令执行超时，请简化指令后重试", None)
+        try:
+            await asyncio.wait_for(_read_stream(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("子进程超时（%d秒），终止 PID=%d", timeout, process.pid)
+            result_text = "指令执行超时，请简化指令后重试"
 
-    await process.wait()
-    logger.info("子进程结束，returncode=%d", process.returncode)
+        # Ensure process is terminated before reading stderr
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
 
-    if process.returncode != 0:
-        stderr_bytes = await process.stderr.read()
-        stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
-        logger.error("Claude CLI 执行失败：returncode=%d, stderr=%s", process.returncode, stderr_str[:500])
-        return (f"执行出错：{stderr_str or result_text}", None)
+        logger.info("子进程结束，returncode=%d", process.returncode)
 
-    logger.info("执行成功，结果长度=%d, session_id=%s", len(result_text), extracted_sid or "N/A")
-    return (result_text, extracted_sid)
+        if process.returncode != 0:
+            stderr_bytes = await process.stderr.read()
+            stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+            logger.error("Claude CLI 执行失败：returncode=%d, stderr=%s", process.returncode, stderr_str[:500])
+            return (f"执行出错：{stderr_str or result_text}", None)
+
+        logger.info("执行成功，结果长度=%d, session_id=%s", len(result_text), extracted_sid or "N/A")
+        return (result_text, extracted_sid)
+    finally:
+        if process.returncode is None:
+            logger.warning("进程仍在运行，强制终止 PID=%d", process.pid)
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
 
 
 def _basename(file_path: str) -> str:
