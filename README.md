@@ -6,9 +6,10 @@
 
 - **消息驱动执行** — 在飞书中发送文字消息即可调用本地 Claude CLI 执行指令，结果以 Markdown 卡片形式返回
 - **流式状态反馈** — 实时推送 Claude 的工具调用状态（读取文件、编辑文件、运行命令），无需等待最终结果
-- **多会话管理** — 支持创建多个独立会话，每个会话绑定不同工作目录，通过 Claude session_id 保持上下文连续
+- **多工作区管理** — 支持创建多个独立工作区，每个工作区绑定不同项目目录，通过 `/workspaces` 查看和切换
+- **多对话上下文** — 每个工作区可维护多个 Claude 对话（session_id），通过 `--resume` 保持上下文连续，支持自由切换和恢复
 - **任务队列** — 执行期间新消息自动排队，完成后合并提交给 Claude，避免丢失用户意图
-- **任务取消** — 随时中断正在执行的任务并清空队列
+- **任务取消** — 随时中断正在执行的任务（跨平台进程树杀死）并清空队列
 - **长文本分段** — 自动将超长回复拆分为多张卡片，在段落边界分割并保护代码块完整性
 
 ## 快速开始
@@ -66,16 +67,26 @@ python main.py
 
 ## 使用方式
 
-### 会话管理
+### 工作区管理
 
 | 命令 | 说明 |
 |------|------|
-| `/new <名称> <工作目录>` | 创建新会话并切换 |
-| `/use <名称>` | 切换到已有会话 |
-| `/sessions` | 查看所有会话 |
-| `/delete <名称>` | 删除会话 |
+| `/new <名称> <工作目录>` | 创建新工作区并切换 |
+| `/use <名称>` | 切换到已有工作区 |
+| `/workspaces` | 查看所有工作区（含对话数量） |
+| `/delete <名称>` | 删除工作区 |
 
-首次发消息时若无活跃会话，Bot 会列出已有会话供你选择。
+首次发消息时若无活跃工作区，Bot 会列出已有工作区供你选择。
+
+### 对话管理
+
+| 命令 | 说明 |
+|------|------|
+| `/sessions` | 查看当前工作区的所有对话 |
+| `/attach <uuid>` | 切换到指定对话（通过 session_id） |
+| `/continue` | 切换到最近一次使用的对话 |
+
+每个工作区可以有多条独立对话，每次执行会自动在当前活跃对话上续接。如果活跃对话不存在，Claude 会创建新对话并自动记录。
 
 ### 任务控制
 
@@ -98,6 +109,29 @@ Bot:  ✏️ 编辑 main.py
 Bot:  [Claude 回复卡片]
 ```
 
+**多对话切换：**
+
+```
+用户: /workspaces
+Bot:  📋 工作区列表：
+       1. my-app (3个对话) ★
+          目录: D:\workspace\my-app
+       2. api-server (1个对话)
+          目录: D:\workspace\api
+
+用户: /sessions
+Bot:  📋 工作区 [my-app] 对话历史：
+       1. a1b2c3d4... (活跃)  上次: 2026-04-09 14:30
+       2. e5f6g7h8...         上次: 2026-04-08 10:15
+       3. i9j0k1l2...         上次: 2026-04-07 09:00
+
+用户: /attach e5f6g7h8-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+Bot:  ✓ 切换到对话 e5f6g7h8...
+
+用户: /continue
+Bot:  ✓ 切换到最近对话 a1b2c3d4...
+```
+
 **排队机制：**
 
 ```
@@ -114,10 +148,10 @@ Bot:  [合并结果卡片]
 feilaude/
 ├── main.py              # 入口：WebSocket 客户端与事件分发
 ├── config.py            # 配置加载（.env + config.yaml）
-├── router.py            # 消息路由：命令分发、会话选择、任务队列
-├── executor.py          # Claude CLI 执行器（流式 JSON 解析）
-├── feishu_sender.py     # 飞书消息发送（文本 + 交互式卡片）
-├── session_manager.py   # 会话管理（CRUD、持久化到 sessions.yaml）
+├── router.py            # 消息路由：命令分发、工作区选择、任务队列
+├── executor.py          # Claude CLI 执行器（流式 JSON 解析、进程树管理）
+├── feishu_sender.py     # 飞书消息发送（文本 + 交互式卡片，同步/异步）
+├── session_manager.py   # 工作区与对话管理（CRUD、多对话、持久化）
 ├── state.py             # Bot 状态机（idle / executing / waiting_select）
 ├── config.yaml          # Claude CLI 配置
 ├── .env.example         # 环境变量模板
@@ -131,20 +165,23 @@ feilaude/
                                             │
                               ┌─────────────┼─────────────┐
                               ▼             ▼             ▼
-                         管理命令      会话选择       Claude 执行
-                        /new /use    waiting模式     executor.py
-                              │             │             │
-                              ▼             ▼             ▼
-                      session_manager   state.py    Claude CLI 子进程
-                              │                           │
-                              ▼                    流式 JSON 事件
-                        sessions.yaml              ▼
-                                            on_status 回调
-                                                  │
-                                                  ▼
-                                          feishu_sender.py
-                                                  │
-                                          飞书卡片/文本消息
+                         管理命令      工作区选择       Claude 执行
+                      /new /use     waiting模式     executor.py
+                    /workspaces                       │
+                    /sessions     session_mgr     Claude CLI 子进程
+                    /attach           │                │
+                    /continue         │         流式 JSON 事件
+                              │       │                │
+                              ▼       ▼                ▼
+                      session_manager  state.py   on_status 回调
+                         │    │                        │
+                         │    ▼                        ▼
+                    工作区   对话列表          feishu_sender.py
+                   (name,   (sids,                      │
+                    workdir) active_sid)       飞书卡片/文本消息
+                         │
+                         ▼
+                    sessions.yaml
 ```
 
 ## 依赖

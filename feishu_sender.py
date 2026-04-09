@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -46,6 +47,14 @@ class FeishuSender:
         for i, segment in enumerate(segments):
             card_title = title if i == 0 else f"{title}（续）"
             self._send_single_card(open_id, segment, card_title)
+
+    async def async_send_message(self, open_id: str, text: str):
+        """Async wrapper for send_message using thread pool."""
+        await asyncio.to_thread(self.send_message, open_id, text)
+
+    async def async_send_card(self, open_id: str, text: str, title: str = "Claude 回复"):
+        """Async wrapper for send_card using thread pool."""
+        await asyncio.to_thread(self.send_card, open_id, text, title)
 
     def _send_single_card(self, open_id: str, text: str, title: str):
         """Send a single interactive card."""

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,12 +14,22 @@ SESSIONS_FILE = Path(__file__).parent / "sessions.yaml"
 
 
 @dataclass
+class SidEntry:
+    sid: str
+    last_used: Optional[str] = None
+
+    def touch(self):
+        self.last_used = datetime.now().isoformat(timespec="seconds")
+
+
+@dataclass
 class Session:
     name: str
     workdir: str
-    sid: Optional[str] = None
-    last_used: Optional[str] = None
     active: bool = False
+    active_sid: Optional[str] = None
+    sids: list[SidEntry] = field(default_factory=list)
+    last_used: Optional[str] = None
 
     def touch(self):
         self.last_used = datetime.now().isoformat(timespec="seconds")
@@ -38,16 +50,32 @@ class SessionManager:
         with open(self._path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         raw = data.get("sessions", [])
-        self._sessions = [
-            Session(
+        self._sessions = []
+        for s in raw:
+            # Migrate legacy format: single sid → sids list + active_sid
+            if "sids" in s and isinstance(s.get("sids"), list):
+                sids = [
+                    SidEntry(sid=e["sid"], last_used=e.get("last_used"))
+                    for e in s["sids"]
+                ]
+                active_sid = s.get("active_sid")
+            else:
+                # Legacy format: single sid field
+                legacy_sid = s.get("sid")
+                if legacy_sid:
+                    sids = [SidEntry(sid=legacy_sid, last_used=s.get("last_used"))]
+                    active_sid = legacy_sid
+                else:
+                    sids = []
+                    active_sid = None
+            self._sessions.append(Session(
                 name=s["name"],
                 workdir=s["workdir"],
-                sid=s.get("sid"),
-                last_used=s.get("last_used"),
                 active=s.get("active", False),
-            )
-            for s in raw
-        ]
+                active_sid=active_sid,
+                sids=sids,
+                last_used=s.get("last_used"),
+            ))
         logger.info("已加载 %d 个会话", len(self._sessions))
 
     def save(self):
@@ -56,9 +84,13 @@ class SessionManager:
                 {
                     "name": s.name,
                     "workdir": s.workdir,
-                    "sid": s.sid,
-                    "last_used": s.last_used,
                     "active": s.active,
+                    "active_sid": s.active_sid,
+                    "sids": [
+                        {"sid": e.sid, "last_used": e.last_used}
+                        for e in s.sids
+                    ],
+                    "last_used": s.last_used,
                 }
                 for s in self._sessions
             ]
@@ -85,7 +117,7 @@ class SessionManager:
     def switch(self, name: str) -> Session:
         s = self._find(name)
         if not s:
-            raise ValueError(f"会话 [{name}] 不存在，/sessions 查看所有会话")
+            raise ValueError(f"会话 [{name}] 不存在，/workspaces 查看所有工作区")
         for s2 in self._sessions:
             s2.active = False
         s.active = True
@@ -117,9 +149,17 @@ class SessionManager:
         s = self._find(name)
         if not s:
             return
-        s.sid = sid
+        # Update existing or append new
+        existing = self._find_sid_entry(s, sid)
+        if existing:
+            existing.touch()
+        else:
+            entry = SidEntry(sid=sid)
+            entry.touch()
+            s.sids.append(entry)
+        s.active_sid = sid
         self.save()
-        logger.info("绑定 session_id 到会话 [%s]: %s", name, sid[:8] + "...")
+        logger.info("更新 session_id 到会话 [%s]: %s", name, sid[:8] + "...")
 
     def touch(self, name: str):
         s = self._find(name)
@@ -133,10 +173,63 @@ class SessionManager:
             return self._sessions[index - 1]
         return None
 
+    # --- sid management ---
+
+    def attach(self, name: str, uuid: str) -> tuple[bool, str]:
+        """Attach to a specific conversation by uuid. Returns (success, message)."""
+        s = self._find(name)
+        if not s:
+            return False, f"会话 [{name}] 不存在"
+        entry = self._find_sid_entry(s, uuid)
+        if not entry:
+            # Fallback: unknown sid — optimistically add and attempt connection
+            entry = SidEntry(sid=uuid)
+            entry.touch()
+            s.sids.append(entry)
+            s.active_sid = uuid
+            self.save()
+            logger.info("attach 未知 sid 到 [%s]: %s (fallback)", name, uuid[:8] + "...")
+            return True, f"⚠ 对话 {uuid[:8]}... 不在本地记录中，已尝试连接"
+        s.active_sid = uuid
+        entry.touch()
+        self.save()
+        logger.info("切换对话到 [%s]: %s", name, uuid[:8] + "...")
+        return True, f"✓ 切换到对话 {uuid[:8]}..."
+
+    def continue_session(self, name: str) -> tuple[bool, str]:
+        """Switch to the most recently used conversation. Returns (success, message)."""
+        s = self._find(name)
+        if not s:
+            return False, f"会话 [{name}] 不存在"
+        if not s.sids:
+            return False, "当前工作区暂无对话历史"
+        # Find the sid with the latest last_used
+        latest = max(s.sids, key=lambda e: e.last_used or "")
+        if s.active_sid == latest.sid:
+            return False, "当前已是最近对话"
+        s.active_sid = latest.sid
+        latest.touch()
+        self.save()
+        logger.info("继续最近对话 [%s]: %s", name, latest.sid[:8] + "...")
+        return True, f"✓ 切换到最近对话 {latest.sid[:8]}..."
+
+    def list_sids(self, name: str) -> list[SidEntry]:
+        """Return the sid list for a session."""
+        s = self._find(name)
+        if not s:
+            return []
+        return list(s.sids)
+
     # --- internal ---
 
     def _find(self, name: str) -> Optional[Session]:
         for s in self._sessions:
             if s.name == name:
                 return s
+        return None
+
+    def _find_sid_entry(self, session: Session, sid: str) -> Optional[SidEntry]:
+        for e in session.sids:
+            if e.sid == sid:
+                return e
         return None

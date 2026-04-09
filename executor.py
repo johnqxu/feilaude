@@ -2,10 +2,26 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import subprocess
 from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _kill_tree(pid: int):
+    """Kill a process and its entire process tree."""
+    if _IS_WINDOWS:
+        # taskkill /F /T kills the process tree forcefully
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        os.killpg(pid, 9)
 
 
 async def execute_claude(
@@ -15,12 +31,16 @@ async def execute_claude(
     timeout: int,
     session_id: Optional[str] = None,
     on_status: Optional[Callable[[str], Awaitable[None]]] = None,
-    cancel_event: Optional[asyncio.Event] = None,
+    on_kill_registered: Optional[Callable[[Callable], None]] = None,
 ) -> tuple[str, Optional[str]]:
     """Execute Claude CLI with stream-json output and return (result_text, session_id)."""
     if not os.path.isfile(cli_path):
         logger.error("Claude CLI 路径不存在：%s", cli_path)
         return (f"Claude CLI 路径不存在：{cli_path}", None)
+
+    if not os.path.isdir(workdir):
+        logger.error("工作目录不存在：%s", workdir)
+        return (f"工作目录不存在：{workdir}", None)
 
     cmd = [cli_path, "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     if session_id:
@@ -39,6 +59,13 @@ async def execute_claude(
             limit=10 * 1024 * 1024,  # 10MB, avoid LimitOverrunError on long JSON lines
         )
         logger.info("子进程已启动，PID=%d", process.pid)
+        if on_kill_registered:
+            def _kill():
+                try:
+                    _kill_tree(process.pid)
+                except Exception:
+                    pass
+            on_kill_registered(_kill)
     except OSError as e:
         logger.error("启动子进程失败：%s", e)
         return (f"启动 Claude CLI 失败：{e}", None)
@@ -51,11 +78,6 @@ async def execute_claude(
         nonlocal result_text, extracted_sid, last_read_file
 
         while True:
-            if cancel_event and cancel_event.is_set():
-                logger.info("检测到取消信号，终止子进程 PID=%d", process.pid)
-                result_text = "任务已取消"
-                return
-
             try:
                 line_bytes = await process.stdout.readline()
             except ValueError as e:
@@ -111,8 +133,8 @@ async def execute_claude(
         # Ensure process is terminated before reading stderr
         if process.returncode is None:
             try:
-                process.kill()
-            except ProcessLookupError:
+                _kill_tree(process.pid)
+            except Exception:
                 pass
             await process.wait()
 
@@ -130,8 +152,8 @@ async def execute_claude(
         if process.returncode is None:
             logger.warning("进程仍在运行，强制终止 PID=%d", process.pid)
             try:
-                process.kill()
-            except ProcessLookupError:
+                _kill_tree(process.pid)
+            except Exception:
                 pass
             await process.wait()
 

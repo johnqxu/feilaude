@@ -19,7 +19,7 @@ def _log_task_exception(task: asyncio.Task):
     if task.exception():
         logger.error("任务未捕获异常：%s", task.exception(), exc_info=task.exception())
 
-MANAGEMENT_COMMANDS = ("/new", "/use", "/sessions", "/delete", "/status", "/cancel")
+MANAGEMENT_COMMANDS = ("/new", "/use", "/sessions", "/workspaces", "/delete", "/status", "/cancel", "/attach", "/continue")
 
 
 def _is_management_command(text: str) -> bool:
@@ -87,7 +87,7 @@ def handle_message(
             sender.send_message(sender_open_id, "请先创建会话：/new <名称> <工作目录>")
             return
         # Stash message and ask user to select
-        _list_sessions(sender_open_id, sender, session_mgr)
+        _list_workspaces(sender_open_id, sender, session_mgr)
         sender.send_message(sender_open_id, "请回复编号或会话名称选择会话，你的指令将在选择后自动执行。")
         state.set_waiting(raw_text)
         return
@@ -165,7 +165,10 @@ def _handle_command(raw_text, sender_open_id, sender, session_mgr, state):
             sender.send_message(sender_open_id, str(e))
 
     elif parts[0] == "/sessions":
-        _list_sessions(sender_open_id, sender, session_mgr)
+        _handle_list_conversations(sender_open_id, sender, session_mgr)
+
+    elif parts[0] == "/workspaces":
+        _list_workspaces(sender_open_id, sender, session_mgr)
 
     elif parts[0] == "/delete":
         if len(parts) < 2:
@@ -186,6 +189,12 @@ def _handle_command(raw_text, sender_open_id, sender, session_mgr, state):
 
     elif parts[0] == "/cancel":
         _handle_cancel(sender_open_id, sender, state)
+
+    elif parts[0] == "/attach":
+        _handle_attach(raw_text, sender_open_id, sender, session_mgr)
+
+    elif parts[0] == "/continue":
+        _handle_continue(sender_open_id, sender, session_mgr)
 
 
 def _handle_status(sender_open_id, sender, state):
@@ -214,24 +223,64 @@ def _handle_cancel(sender_open_id, sender, state):
         sender.send_message(sender_open_id, "当前没有正在执行的任务")
         return
 
-    if state.cancel_event:
-        state.cancel_event.set()
+    state.kill_process()
     state.clear_queue()
     sender.send_message(sender_open_id, "已取消当前任务并清空队列")
 
 
-def _list_sessions(sender_open_id, sender, session_mgr):
+def _list_workspaces(sender_open_id, sender, session_mgr):
     sessions = session_mgr.list()
     if not sessions:
         sender.send_message(sender_open_id, "暂无会话，请使用 /new <名称> <工作目录> 创建")
         return
-    lines = ["📋 会话列表：\n"]
+    lines = ["📋 工作区列表：\n"]
     for i, s in enumerate(sessions, 1):
         active_mark = " ★" if s.active else ""
-        sid_status = "已绑定" if s.sid else "新会话"
-        lines.append(f"  {i}. {s.name} ({sid_status}){active_mark}")
+        conv_count = len(s.sids)
+        lines.append(f"  {i}. {s.name} ({conv_count}个对话){active_mark}")
         lines.append(f"     目录: {s.workdir}")
     sender.send_message(sender_open_id, "\n".join(lines))
+
+
+def _handle_list_conversations(sender_open_id, sender, session_mgr):
+    active = session_mgr.get_active()
+    if not active:
+        sender.send_message(sender_open_id, "请先选择工作区：/use <名称>")
+        return
+    sids = session_mgr.list_sids(active.name)
+    if not sids:
+        sender.send_message(sender_open_id, "当前工作区暂无对话历史")
+        return
+    lines = [f"📋 工作区 [{active.name}] 对话历史：\n"]
+    for i, e in enumerate(sids, 1):
+        active_mark = " (活跃)" if e.sid == active.active_sid else ""
+        sid_display = e.sid[:8] + "..."
+        time_display = e.last_used[5:16] if e.last_used else "N/A"
+        lines.append(f"  {i}. {sid_display}{active_mark}  上次: {time_display}")
+    sender.send_message(sender_open_id, "\n".join(lines))
+
+
+def _handle_attach(raw_text, sender_open_id, sender, session_mgr):
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        sender.send_message(sender_open_id, "用法：/attach <uuid>")
+        return
+    uuid = parts[1].strip()
+    active = session_mgr.get_active()
+    if not active:
+        sender.send_message(sender_open_id, "请先选择工作区：/use <名称>")
+        return
+    success, msg = session_mgr.attach(active.name, uuid)
+    sender.send_message(sender_open_id, msg)
+
+
+def _handle_continue(sender_open_id, sender, session_mgr):
+    active = session_mgr.get_active()
+    if not active:
+        sender.send_message(sender_open_id, "请先选择工作区：/use <名称>")
+        return
+    success, msg = session_mgr.continue_session(active.name)
+    sender.send_message(sender_open_id, msg)
 
 
 # ---- Claude execution ----
@@ -241,7 +290,7 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
     state.set_executing(raw_text)
 
     async def on_status(status_text: str):
-        sender.send_message(sender_open_id, status_text)
+        await sender.async_send_message(sender_open_id, status_text)
 
     async def run():
         try:
@@ -250,18 +299,18 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
                 cli_path=config.cli_path,
                 workdir=session.workdir,
                 timeout=config.timeout,
-                session_id=session.sid,
+                session_id=session.active_sid,
                 on_status=on_status,
-                cancel_event=state.cancel_event,
+                on_kill_registered=state.register_kill,
             )
 
-            # Update session: bind sid if first time, touch last_used
-            if sid and not session.sid:
+            # Update session: add/update sid in sids list, set as active_sid
+            if sid:
                 session_mgr.update_sid(session.name, sid)
             session_mgr.touch(session.name)
 
             logger.info("执行完成，结果长度=%d", len(text))
-            sender.send_card(sender_open_id, text)
+            await sender.async_send_card(sender_open_id, text)
 
             # Check for queued messages (only on success)
             queued = state.drain_queue()
@@ -270,7 +319,7 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
                 _execute_and_reply(merged, session, sender_open_id, sender, config, session_mgr, state)
         except Exception as e:
             logger.error("执行任务异常", exc_info=True)
-            sender.send_message(sender_open_id, f"执行出错：{e}")
+            await sender.async_send_message(sender_open_id, f"执行出错：{e}")
             state.drain_queue()  # discard queued messages on failure
         finally:
             state.set_idle()

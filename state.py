@@ -1,6 +1,6 @@
-import asyncio
 import logging
 import time
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ class BotState:
         self.exec_task_summary: str | None = None
         self.exec_start_time: float | None = None
         self.queue: list[str] = []
-        self.cancel_event: asyncio.Event | None = None
+        self._kill_callback: Optional[Callable] = None
 
     @property
     def is_waiting_select(self) -> bool:
@@ -38,15 +38,23 @@ class BotState:
         self.exec_status = "executing"
         self.exec_task_summary = summary[:30]
         self.exec_start_time = time.time()
-        self.cancel_event = asyncio.Event()
         logger.info("开始执行：%s", self.exec_task_summary)
 
     def set_idle(self):
         self.exec_status = "idle"
         self.exec_task_summary = None
         self.exec_start_time = None
-        self.cancel_event = None
+        self._kill_callback = None
         logger.info("执行结束，回到空闲状态")
+
+    def register_kill(self, callback: Callable):
+        self._kill_callback = callback
+
+    def kill_process(self):
+        if self._kill_callback:
+            logger.info("调用 kill 回调终止进程")
+            self._kill_callback()
+            self._kill_callback = None
 
     def enqueue(self, text: str) -> int:
         self.queue.append(text)
