@@ -1,0 +1,5 @@
+claude:
+  cli_path: "claude"              # Claude CLI 可执行文件路径，如在 PATH 中可直接用 "claude"
+  workdir: "."                    # 默认工作目录
+  timeout: 600                    # 执行超时（秒）
+  # sessions_file: sessions.yaml  # 会话数据文件路径（默认为项目根目录下的 sessions.yaml）

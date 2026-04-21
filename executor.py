@@ -57,6 +57,7 @@ async def execute_claude(
             stderr=subprocess.PIPE,
             cwd=workdir,
             limit=10 * 1024 * 1024,  # 10MB, avoid LimitOverrunError on long JSON lines
+            **({} if _IS_WINDOWS else {"start_new_session": True}),
         )
         logger.info("子进程已启动，PID=%d", process.pid)
         if on_kill_registered:
@@ -108,6 +109,8 @@ async def execute_claude(
                 message = event.get("message", {})
                 for content_block in message.get("content", []):
                     if content_block.get("type") == "tool_use":
+                        tool_name = content_block.get("name", "")
+                        logger.info("检测到工具调用：%s", tool_name)
                         await _handle_tool_use(content_block, on_status, last_read_file)
                         # Update last_read_file tracking
                         tool_name = content_block.get("name", "")

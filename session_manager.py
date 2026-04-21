@@ -10,8 +10,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-SESSIONS_FILE = Path(__file__).parent / "sessions.yaml"
-
 
 @dataclass
 class SidEntry:
@@ -36,7 +34,7 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self, path: Path = SESSIONS_FILE):
+    def __init__(self, path: Path = Path("sessions.yaml")):
         self._path = path
         self._sessions: list[Session] = []
         self.load()

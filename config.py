@@ -41,4 +41,5 @@ class Config:
         self.cli_path = claude_cfg.get("cli_path", "claude")
         self.workdir = claude_cfg.get("workdir", str(base_dir))
         self.timeout = claude_cfg.get("timeout", 600)
+        self.sessions_file = base_dir / claude_cfg.get("sessions_file", "sessions.yaml")
         logger.info("配置加载完成：cli_path=%s, workdir=%s, timeout=%ds", self.cli_path, self.workdir, self.timeout)

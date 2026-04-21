@@ -13,6 +13,9 @@ venv/
 # Environment variables
 .env
 
+# Config (contains machine-specific paths)
+config.yaml
+
 # IDE
 .vscode/
 .idea/

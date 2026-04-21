@@ -7,7 +7,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
 logger = logging.getLogger(__name__)
 
-MAX_SEGMENT_LEN = 2000
+MAX_SEGMENT_LEN = 4000
 
 
 class FeishuSender:
@@ -57,15 +57,13 @@ class FeishuSender:
         await asyncio.to_thread(self.send_card, open_id, text, title)
 
     def _send_single_card(self, open_id: str, text: str, title: str):
-        """Send a single interactive card."""
+        """Send a single interactive card with markdown content."""
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": title}
             },
-            "elements": [
-                {"tag": "markdown", "content": text}
-            ]
+            "elements": [{"tag": "markdown", "content": text}]
         }
         content_json = json.dumps(card, ensure_ascii=False)
 
@@ -147,3 +145,5 @@ def _protect_code_blocks(segment: str, remainder: str) -> tuple[str, str]:
 
     # Odd number means unclosed code block — close it
     return segment + "\n```\n", "```\n" + remainder
+
+

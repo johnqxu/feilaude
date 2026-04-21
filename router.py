@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import time
@@ -11,13 +12,14 @@ from state import BotState
 logger = logging.getLogger(__name__)
 
 
-def _log_task_exception(task: asyncio.Task):
+def _log_task_exception(fut: concurrent.futures.Future):
     """Done callback to catch exceptions that escaped try/except."""
-    if task.cancelled():
+    if fut.cancelled():
         logger.warning("任务被取消")
         return
-    if task.exception():
-        logger.error("任务未捕获异常：%s", task.exception(), exc_info=task.exception())
+    exc = fut.exception()
+    if exc:
+        logger.error("任务未捕获异常：%s", exc, exc_info=exc)
 
 MANAGEMENT_COMMANDS = ("/new", "/use", "/sessions", "/workspaces", "/delete", "/status", "/cancel", "/attach", "/continue")
 
@@ -36,6 +38,7 @@ def handle_message(
     sender: FeishuSender,
     session_mgr: SessionManager,
     state: BotState,
+    loop: asyncio.AbstractEventLoop,
 ):
     event_data = event.event
     message = event_data.message
@@ -64,7 +67,7 @@ def handle_message(
 
     # ---- WAITING_SELECT mode ----
     if state.is_waiting_select:
-        _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr, state)
+        _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr, state, loop)
         return
 
     # ---- Management commands (always handled locally) ----
@@ -93,13 +96,13 @@ def handle_message(
         return
 
     # Active session exists → execute
-    _execute_and_reply(raw_text, active, sender_open_id, sender, config, session_mgr, state)
+    _execute_and_reply(raw_text, active, sender_open_id, sender, config, session_mgr, state, loop)
 
 
 # ---- Session selection in WAITING_SELECT mode ----
 
-def _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr, state):
-    pending = state.pending_message
+def _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr, state, loop):
+    pending = state.get_pending()
 
     # Allow /new in waiting mode
     if raw_text.startswith("/new ") or raw_text == "/new":
@@ -108,7 +111,7 @@ def _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr
         active = session_mgr.get_active()
         if active and pending:
             state.clear_pending()
-            _execute_and_reply(pending, active, sender_open_id, sender, config, session_mgr, state)
+            _execute_and_reply(pending, active, sender_open_id, sender, config, session_mgr, state, loop)
         return
 
     # Try to match by number
@@ -120,7 +123,7 @@ def _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr
             sender.send_message(sender_open_id, f"✓ 切换到会话 [{session.name}]")
             state.clear_pending()
             if pending:
-                _execute_and_reply(pending, session, sender_open_id, sender, config, session_mgr, state)
+                _execute_and_reply(pending, session, sender_open_id, sender, config, session_mgr, state, loop)
             return
     except ValueError:
         pass
@@ -132,7 +135,7 @@ def _handle_waiting_select(raw_text, sender_open_id, sender, config, session_mgr
             sender.send_message(sender_open_id, f"✓ 切换到会话 [{s.name}]")
             state.clear_pending()
             if pending:
-                _execute_and_reply(pending, s, sender_open_id, sender, config, session_mgr, state)
+                _execute_and_reply(pending, s, sender_open_id, sender, config, session_mgr, state, loop)
             return
 
     sender.send_message(sender_open_id, "无效选择，请回复编号或会话名称")
@@ -198,20 +201,21 @@ def _handle_command(raw_text, sender_open_id, sender, session_mgr, state):
 
 
 def _handle_status(sender_open_id, sender, state):
-    if not state.is_executing:
+    snap = state.get_status_snapshot()
+    if not snap.is_executing:
         sender.send_message(sender_open_id, "🟢 Bot 状态：空闲")
         return
 
     lines = ["🔴 Bot 状态：执行中"]
-    if state.exec_task_summary:
-        lines.append(f"📋 当前任务：{state.exec_task_summary}")
-    if state.exec_start_time:
-        elapsed = int(time.time() - state.exec_start_time)
+    if snap.task_summary:
+        lines.append(f"📋 当前任务：{snap.task_summary}")
+    if snap.start_time:
+        elapsed = int(time.time() - snap.start_time)
         minutes, seconds = divmod(elapsed, 60)
         lines.append(f"⏱️ 已执行：{minutes}分{seconds}秒")
-    if state.queue:
-        lines.append(f"📥 排队任务（{len(state.queue)}条）：")
-        for i, msg in enumerate(state.queue, 1):
+    if snap.queue:
+        lines.append(f"📥 排队任务（{len(snap.queue)}条）：")
+        for i, msg in enumerate(snap.queue, 1):
             display = msg[:30] + ("..." if len(msg) > 30 else "")
             lines.append(f"  {i}. {display}")
 
@@ -219,13 +223,10 @@ def _handle_status(sender_open_id, sender, state):
 
 
 def _handle_cancel(sender_open_id, sender, state):
-    if not state.is_executing:
+    if state.try_cancel():
+        sender.send_message(sender_open_id, "已取消当前任务并清空队列")
+    else:
         sender.send_message(sender_open_id, "当前没有正在执行的任务")
-        return
-
-    state.kill_process()
-    state.clear_queue()
-    sender.send_message(sender_open_id, "已取消当前任务并清空队列")
 
 
 def _list_workspaces(sender_open_id, sender, session_mgr):
@@ -255,7 +256,7 @@ def _handle_list_conversations(sender_open_id, sender, session_mgr):
     for i, e in enumerate(sids, 1):
         active_mark = " (活跃)" if e.sid == active.active_sid else ""
         sid_display = e.sid[:8] + "..."
-        time_display = e.last_used[5:16] if e.last_used else "N/A"
+        time_display = e.last_used[:16].replace("T", " ") if e.last_used and len(e.last_used) >= 16 else "N/A"
         lines.append(f"  {i}. {sid_display}{active_mark}  上次: {time_display}")
     sender.send_message(sender_open_id, "\n".join(lines))
 
@@ -285,9 +286,12 @@ def _handle_continue(sender_open_id, sender, session_mgr):
 
 # ---- Claude execution ----
 
-def _execute_and_reply(raw_text, session, sender_open_id, sender, config, session_mgr, state):
+def _execute_and_reply(raw_text, session, sender_open_id, sender, config, session_mgr, state, loop):
+    if not state.try_start_executing(raw_text):
+        pos = state.enqueue(raw_text)
+        sender.send_message(sender_open_id, f"已排队（第 {pos} 位）")
+        return
     sender.send_message(sender_open_id, "已收到指令，正在调用 Claude 执行...")
-    state.set_executing(raw_text)
 
     async def on_status(status_text: str):
         await sender.async_send_message(sender_open_id, status_text)
@@ -312,11 +316,15 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
             logger.info("执行完成，结果长度=%d", len(text))
             await sender.async_send_card(sender_open_id, text)
 
+            # Mark idle BEFORE draining queue so _execute_and_reply can
+            # successfully call try_start_executing for the next message.
+            state.set_idle()
+
             # Check for queued messages (only on success)
             queued = state.drain_queue()
             if queued:
                 merged = _merge_queue(queued)
-                _execute_and_reply(merged, session, sender_open_id, sender, config, session_mgr, state)
+                _execute_and_reply(merged, session, sender_open_id, sender, config, session_mgr, state, loop)
         except Exception as e:
             logger.error("执行任务异常", exc_info=True)
             await sender.async_send_message(sender_open_id, f"执行出错：{e}")
@@ -324,8 +332,8 @@ def _execute_and_reply(raw_text, session, sender_open_id, sender, config, sessio
         finally:
             state.set_idle()
 
-    task = asyncio.get_event_loop().create_task(run())
-    task.add_done_callback(_log_task_exception)
+    future = asyncio.run_coroutine_threadsafe(run(), loop)
+    future.add_done_callback(_log_task_exception)
 
 
 def _merge_queue(messages: list[str]) -> str:
